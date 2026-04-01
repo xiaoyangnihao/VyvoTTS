@@ -1,118 +1,73 @@
-from snac import SNAC
+import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import List, Tuple, Optional, Dict, Any
-import yaml
-import time
+from typing import Tuple, Optional, Dict, Any
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+from vyvotts.inference.base import BaseVyvoTTSInference
 
 
-class VyvoTTSTransformersInference:
-    """TTS inference engine using Transformers backend."""
+class VyvoTTSTransformersInference(BaseVyvoTTSInference):
+    """TTS inference engine using HuggingFace Transformers."""
 
     def __init__(
         self,
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
-        device: str = "cuda"
+        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        device: str = "cuda",
+        attn_implementation: str = "sdpa",
     ):
-        """Initialize the TTS inference engine.
-
-        Args:
-            config: Configuration dictionary containing token constants
-            config_path: Path to YAML config file (alternative to config dict)
-            model_name: HuggingFace model identifier for the TTS model
-            device: Device to run the model on
-        """
-        # Load configuration
-        if config is not None:
-            self.config = config
-        elif config_path is not None:
-            self.config = load_config(config_path)
-        else:
-            # Default config path
-            default_config_path = "vyvotts/configs/inference/lfm2.yaml"
-            self.config = load_config(default_config_path)
-
-        # Set token constants from config
-        self.TOKENIZER_LENGTH = self.config['TOKENIZER_LENGTH']
-        self.START_OF_TEXT = self.config['START_OF_TEXT']
-        self.END_OF_TEXT = self.config['END_OF_TEXT']
-        self.START_OF_SPEECH = self.config['START_OF_SPEECH']
-        self.END_OF_SPEECH = self.config['END_OF_SPEECH']
-        self.START_OF_HUMAN = self.config['START_OF_HUMAN']
-        self.END_OF_HUMAN = self.config['END_OF_HUMAN']
-        self.START_OF_AI = self.config['START_OF_AI']
-        self.END_OF_AI = self.config['END_OF_AI']
-        self.PAD_TOKEN = self.config['PAD_TOKEN']
-        self.AUDIO_TOKENS_START = self.config['AUDIO_TOKENS_START']
-
+        super().__init__(config, config_path)
         self.device = device
-        self._initialize_models(model_name)
 
-    def _initialize_models(self, model_name: str):
-        """Initialize SNAC model, language model, and tokenizer."""
-        self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
-        self.snac_model = self.snac_model.to(self.device)
-
+        self.snac_model = self._load_snac_model(snac_model_name, device=device)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="kernels-community/flash-attn3:flash_attention",
+            attn_implementation=attn_implementation,
             device_map="auto",
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def _preprocess_prompts(self, prompts: List[str], chosen_voice: Optional[str] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Preprocess prompts by tokenizing, adding special tokens, and padding."""
-        if chosen_voice:
-            prompts = [f"{chosen_voice}: " + p for p in prompts]
+    def generate(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        max_new_tokens: int = 1200,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.1,
+        output_path: Optional[str] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """Generate speech from text input.
 
-        all_input_ids = []
-        for prompt in prompts:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-            all_input_ids.append(input_ids)
+        Args:
+            text: Input text to convert to speech.
+            voice: Optional voice identifier.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            top_p: Top-p sampling parameter.
+            repetition_penalty: Penalty for token repetition.
+            output_path: Optional path to save audio file.
 
-        start_token = torch.tensor([[self.START_OF_HUMAN]], dtype=torch.int64)
-        end_tokens = torch.tensor([[self.END_OF_TEXT, self.END_OF_HUMAN]], dtype=torch.int64)
-
-        all_modified_input_ids = []
-        for input_ids in all_input_ids:
-            modified_input_ids = torch.cat([start_token, input_ids, end_tokens], dim=1)
-            all_modified_input_ids.append(modified_input_ids)
-
-        all_padded_tensors = []
-        all_attention_masks = []
-        max_length = max([modified_input_ids.shape[1] for modified_input_ids in all_modified_input_ids])
-
-        for modified_input_ids in all_modified_input_ids:
-            padding = max_length - modified_input_ids.shape[1]
-            padded_tensor = torch.cat([torch.full((1, padding), self.PAD_TOKEN, dtype=torch.int64), modified_input_ids], dim=1)
-            attention_mask = torch.cat([torch.zeros((1, padding), dtype=torch.int64), torch.ones((1, modified_input_ids.shape[1]), dtype=torch.int64)], dim=1)
-            all_padded_tensors.append(padded_tensor)
-            all_attention_masks.append(attention_mask)
-
-        all_padded_tensors = torch.cat(all_padded_tensors, dim=0)
-        all_attention_masks = torch.cat(all_attention_masks, dim=0)
-
-        input_ids = all_padded_tensors.to(self.device)
-        attention_mask = all_attention_masks.to(self.device)
-
-        return input_ids, attention_mask
-
-    def _generate_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                      max_new_tokens: int = 1200, temperature: float = 0.6,
-                      top_p: float = 0.95, repetition_penalty: float = 1.1) -> Tuple[torch.Tensor, float]:
-        """Generate text using the language model."""
+        Returns:
+            Tuple of (audio tensor, timing info dict).
+        """
         torch.cuda.synchronize()
-        start_time = time.time()
+        total_start = time.time()
 
+        # Preprocess
+        torch.cuda.synchronize()
+        t0 = time.time()
+        tokens = self._build_prompt_tokens(text, voice)
+        input_ids, attention_mask = self._pad_and_batch([tokens], device=self.device)
+        torch.cuda.synchronize()
+        preprocess_time = time.time() - t0
+
+        # Generate
+        torch.cuda.synchronize()
+        t0 = time.time()
         with torch.no_grad():
             generated_ids = self.model.generate(
                 input_ids=input_ids,
@@ -125,152 +80,30 @@ class VyvoTTSTransformersInference:
                 num_return_sequences=1,
                 eos_token_id=self.END_OF_SPEECH,
             )
-
         torch.cuda.synchronize()
-        generation_time = time.time() - start_time
+        generation_time = time.time() - t0
 
-        return generated_ids, generation_time
-
-    def _redistribute_codes(self, code_list: List[int]) -> torch.Tensor:
-        """Redistribute codes into layers and decode to audio."""
-        layer_1 = []
-        layer_2 = []
-        layer_3 = []
-        for i in range((len(code_list)+1)//7):
-            layer_1.append(code_list[7*i])
-            layer_2.append(code_list[7*i+1]-4096)
-            layer_3.append(code_list[7*i+2]-(2*4096))
-            layer_3.append(code_list[7*i+3]-(3*4096))
-            layer_2.append(code_list[7*i+4]-(4*4096))
-            layer_3.append(code_list[7*i+5]-(5*4096))
-            layer_3.append(code_list[7*i+6]-(6*4096))
-
-        codes = [torch.tensor(layer_1).unsqueeze(0),
-                 torch.tensor(layer_2).unsqueeze(0),
-                 torch.tensor(layer_3).unsqueeze(0)]
-
-        codes = [c.to(self.device) for c in codes]
-        audio_hat = self.snac_model.decode(codes)
-        return audio_hat
-
-    def _parse_output_to_audio(self, generated_ids: torch.Tensor) -> Tuple[List[torch.Tensor], float]:
-        """Parse generated token IDs and convert to audio samples."""
+        # Decode audio
         torch.cuda.synchronize()
-        start_time = time.time()
-
-        token_to_find = self.START_OF_SPEECH
-        token_to_remove = self.END_OF_SPEECH
-
-        token_indices = (generated_ids == token_to_find).nonzero(as_tuple=True)
-
-        if len(token_indices[1]) > 0:
-            last_occurrence_idx = token_indices[1][-1].item()
-            cropped_tensor = generated_ids[:, last_occurrence_idx+1:]
-        else:
-            cropped_tensor = generated_ids
-
-        processed_rows = []
-        for row in cropped_tensor:
-            masked_row = row[row != token_to_remove]
-            processed_rows.append(masked_row)
-
-        code_lists = []
-        for row in processed_rows:
-            row_length = row.size(0)
-            new_length = (row_length // 7) * 7
-            trimmed_row = row[:new_length]
-            trimmed_row = [t - self.AUDIO_TOKENS_START for t in trimmed_row]
-            code_lists.append(trimmed_row)
-
-        my_samples = []
-        for code_list in code_lists:
-            samples = self._redistribute_codes(code_list)
-            my_samples.append(samples)
-
+        t0 = time.time()
+        audio_samples = self._extract_audio_from_tokens(generated_ids, device=self.device)
         torch.cuda.synchronize()
-        audio_processing_time = time.time() - start_time
+        audio_time = time.time() - t0
 
-        return my_samples, audio_processing_time
-
-    def generate(self, text: str, voice: Optional[str] = None,
-                max_new_tokens: int = 1200, temperature: float = 0.6,
-                top_p: float = 0.95, repetition_penalty: float = 1.1,
-                output_path: Optional[str] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Generate speech from text input.
-
-        Args:
-            text: Input text to convert to speech
-            voice: Optional voice identifier
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling parameter
-            repetition_penalty: Penalty for token repetition
-            output_path: Optional path to save audio file
-
-        Returns:
-            Audio tensor and timing information dictionary
-        """
-        torch.cuda.synchronize()
-        total_start_time = time.time()
-
-        # Preprocessing
-        torch.cuda.synchronize()
-        preprocess_start = time.time()
-        input_ids, attention_mask = self._preprocess_prompts([text], voice)
-        torch.cuda.synchronize()
-        preprocess_time = time.time() - preprocess_start
-
-        # Text generation
-        generated_ids, generation_time = self._generate_text(
-            input_ids, attention_mask, max_new_tokens, temperature, top_p, repetition_penalty
-        )
-
-        # Audio processing
-        audio_samples, audio_processing_time = self._parse_output_to_audio(generated_ids)
-
-        torch.cuda.synchronize()
-        total_time = time.time() - total_start_time
+        total_time = time.time() - total_start
 
         timing_info = {
             'preprocessing_time': preprocess_time,
             'generation_time': generation_time,
-            'audio_processing_time': audio_processing_time,
-            'total_time': total_time
+            'audio_processing_time': audio_time,
+            'total_time': total_time,
         }
 
         audio = audio_samples[0] if audio_samples else None
-
-        # Save audio if output path provided
         if output_path and audio is not None:
             self.save_audio(audio, output_path)
 
         return audio, timing_info
-
-    def save_audio(
-        self,
-        audio_tensor: torch.Tensor,
-        output_path: str,
-        sample_rate: int = 24000
-    ) -> None:
-        """Save audio tensor to file.
-
-        Args:
-            audio_tensor: Audio tensor to save
-            output_path: Path to save the audio file
-            sample_rate: Sample rate for the audio (defaults to 24000)
-        """
-        import soundfile as sf
-        from pathlib import Path
-
-        if audio_tensor is None:
-            raise ValueError("No audio tensor provided")
-
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Convert to numpy and save
-        audio_numpy = audio_tensor.detach().squeeze().cpu().numpy()
-        sf.write(output_path, audio_numpy, sample_rate)
 
 
 def main():
