@@ -1,13 +1,13 @@
 import torch
+import sglang as sgl
 from typing import Optional, Dict, Any
-from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 from vyvotts.inference.base import BaseVyvoTTSInference
 
 
-class VyvoTTSInference(BaseVyvoTTSInference):
-    """High-performance TTS inference engine using vLLM backend."""
+class VyvoTTSSGLangInference(BaseVyvoTTSInference):
+    """High-performance TTS inference engine using SGLang backend."""
 
     def __init__(
         self,
@@ -15,19 +15,18 @@ class VyvoTTSInference(BaseVyvoTTSInference):
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
         snac_model_name: str = "hubertsiuzdak/snac_24khz",
-        enforce_eager: bool = False,
-        max_model_len: int = 2048,
-        gpu_memory_utilization: float = 0.95,
-        **llm_kwargs,
+        context_length: int = 2048,
+        mem_fraction_static: float = 0.90,
+        **engine_kwargs,
     ):
         super().__init__(config, config_path)
 
-        self.engine = LLM(
-            model=model_name,
-            enforce_eager=enforce_eager,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=gpu_memory_utilization,
-            **llm_kwargs,
+        self.engine = sgl.Engine(
+            model_path=model_name,
+            context_length=context_length,
+            mem_fraction_static=mem_fraction_static,
+            attention_backend="triton",
+            **engine_kwargs,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.snac_model = self._load_snac_model(snac_model_name)
@@ -57,18 +56,22 @@ class VyvoTTSInference(BaseVyvoTTSInference):
             Audio tensor containing the generated speech, or None on failure.
         """
         prompt_ids = self._build_prompt_tokens(text, voice)
-        final_prompt = self.tokenizer.decode(prompt_ids[0])
+        input_ids_list = prompt_ids[0].tolist()
 
-        params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            stop_token_ids=[self.END_OF_SPEECH],
-            repetition_penalty=repetition_penalty,
+        sampling_params = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_new_tokens": max_tokens,
+            "stop_token_ids": [self.END_OF_SPEECH],
+            "repetition_penalty": repetition_penalty,
+            "skip_special_tokens": False,
+        }
+
+        outputs = self.engine.generate(
+            input_ids=[input_ids_list],
+            sampling_params=sampling_params,
         )
-
-        outputs = self.engine.generate([final_prompt], [params])
-        token_ids = outputs[0].outputs[0].token_ids
+        token_ids = outputs[0]["output_ids"]
         generated_ids = torch.tensor([token_ids], dtype=torch.long)
 
         audio_samples = self._extract_audio_from_tokens(generated_ids)
@@ -79,15 +82,21 @@ class VyvoTTSInference(BaseVyvoTTSInference):
 
         return audio
 
+    def shutdown(self):
+        """Release GPU resources and kill subprocesses."""
+        self.engine.shutdown()
+
 
 def text_to_speech(
     prompt: str,
     voice: Optional[str] = None,
     config_path: Optional[str] = None,
 ) -> Optional[torch.Tensor]:
-    """Generate speech from text using vLLM engine."""
-    engine = VyvoTTSInference(config_path=config_path)
-    return engine.generate(prompt, voice)
+    """Generate speech from text using SGLang engine."""
+    engine = VyvoTTSSGLangInference(config_path=config_path)
+    audio = engine.generate(prompt, voice)
+    engine.shutdown()
+    return audio
 
 
 if __name__ == "__main__":
